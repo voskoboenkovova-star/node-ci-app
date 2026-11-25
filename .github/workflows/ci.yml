@@ -1,26 +1,124 @@
-name: Node.js CI Pipeline
+﻿name: CI and Cloud EC2 Deploy (LocalStack Simulation)
+
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+  workflow_dispatch:
+
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up Node.js
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18.x'
-      - name: Install dependencies
-        run: npm install
-      - name: Run build
-        run: npm run build
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-artifact
-          path: |
-            dist/
-            build/
-            *.js
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies and run tests
+        run: |
+          npm ci || npm install
+          npm test --if-present
+
+      - name: Simulate EC2 infrastructure in LocalStack
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run -d --name localstack -p 127.0.0.1:4566:4566 -e SERVICES=ec2 localstack/localstack:3.0
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:4566/_localstack/health | grep -q '"ec2"'; then
+              echo "LocalStack EC2 is ready"
+              break
+            fi
+            sleep 2
+          done
+
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq awscli >/dev/null
+          fi
+
+          aws --endpoint-url=http://127.0.0.1:4566 ec2 create-key-pair \
+            --key-name devops-key \
+            --query 'KeyMaterial' \
+            --output text > devops-key.pem
+          chmod 600 devops-key.pem
+
+          aws --endpoint-url=http://127.0.0.1:4566 ec2 create-security-group \
+            --group-name devops-sg \
+            --description "Security group for DevOps EC2" || true
+
+          aws --endpoint-url=http://127.0.0.1:4566 ec2 authorize-security-group-ingress \
+            --group-name devops-sg \
+            --protocol tcp \
+            --port 22 \
+            --cidr 0.0.0.0/0 || true
+
+          aws --endpoint-url=http://127.0.0.1:4566 ec2 run-instances \
+            --image-id ami-021bf0bba3a411792 \
+            --instance-type t2.micro \
+            --key-name devops-key \
+            --security-groups devops-sg \
+            --region us-east-1 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=devops-lab}]'
+
+      - name: Decode SSH key
+        env:
+          KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+        run: |
+          if [ -n "$KEY_B64" ]; then
+            echo "$KEY_B64" | base64 -d > ec2-key.pem
+          elif [ -f devops-key.pem ]; then
+            cp devops-key.pem ec2-key.pem
+          else
+            ssh-keygen -t rsa -b 2048 -N "" -f ec2-key.pem >/dev/null
+          fi
+          chmod 600 ec2-key.pem
+
+      - name: Copy files to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER || 'ubuntu' }}
+        run: |
+          if [ -n "$EC2_HOST" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq rsync >/dev/null
+            rsync -avz --exclude='.git' --exclude='node_modules' \
+              -e "ssh -i ec2-key.pem -o StrictHostKeyChecking=no" \
+              ./ "${EC2_USER}@${EC2_HOST}:/home/${EC2_USER}/nodeapp"
+          else
+            TARGET_DIR="/tmp/sim-ec2/home/${EC2_USER}/nodeapp"
+            mkdir -p "$TARGET_DIR"
+            cp -r index.js package.json "$TARGET_DIR/"
+            echo "Copied app files to $TARGET_DIR"
+          fi
+
+      - name: Run app on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER || 'ubuntu' }}
+        run: |
+          if [ -n "$EC2_HOST" ]; then
+            ssh -i ec2-key.pem -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" << 'EOF'
+              cd /home/ubuntu/nodeapp
+              npm install --omit=dev
+              node index.js &
+              sleep 2
+              curl -sf http://127.0.0.1:3000/ || true
+EOF
+          else
+            TARGET_DIR="/tmp/sim-ec2/home/${EC2_USER}/nodeapp"
+            cd "$TARGET_DIR"
+            npm install --omit=dev >/dev/null
+            PORT=3000 node index.js &
+            APP_PID=$!
+            sleep 2
+            curl -sf http://127.0.0.1:3000/ || (kill $APP_PID 2>/dev/null || true; exit 1)
+            echo ""
+            kill $APP_PID 2>/dev/null || true
+          fi
